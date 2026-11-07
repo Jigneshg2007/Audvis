@@ -1,87 +1,150 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <limits.h>
+module i2s_tx #(
+    parameter int unsigned CLK_HZ = 100_000_000,
+    parameter int unsigned SAMPLE_HZ = 48_000, 
+    parameter int unsigned SAMPLE_W = 16,
+    parameter int unsigned CHNL_CNT = 2
+)(
+    input logic clk_i,
+    input logic rst_ni,
+    input logic enable_i, 
 
-static int isPrime(int n) {
-    if (n < 2) return 0;
-    if (n == 2) return 1;
-    if (n % 2 == 0) return 0;
-    for (int i = 3; i * i <= n; i += 2) {
-        if (n % i == 0) return 0;
-    }
-    return 1;
-}
+    //Sample steam input (from audio_dma)
+    input logic [SAMPLE_W-1:0] sample_i,
+    input logic sample_valid_i,
+    output logic sample_ready_o,
 
-static void flush_stdin(void) {
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF);
-}
+    //I2S output 
+    output logic i2s_sdata_o,
+    output logic i2s_bclk_o,
+    output logic i2s_lrclk_o, 
 
-int main(void) {
-    int n;
 
-    while (1) {
-        printf("How many numbers do you want to enter? ");
-        if (scanf("%d", &n) != 1) {
-            printf("Invalid input. Please enter a positive integer.\n");
-            flush_stdin();
-            continue;
-        }
-        if (n > 0) break;
-        printf("Please enter a positive number.\n");
-    }
+    //Status / interrupts 
+    output logic underrun_o,
+    output logic irq_o
+);
 
-    int *nums = malloc((size_t)n * sizeof(int));
-    if (!nums) {
-        fprintf(stderr, "Error: memory allocation failed.\n");
-        return 1;
-    }
+localparam int unsigned BCLK_HZ = SAMPLE_HZ * CHNL_CNT * SAMPLE_W;
+localparam int unsigned LRCLK_HZ = SAMPLE_HZ;
+//localparam int unsigned BCLK_TOGGLE = 2 * BCLK_HZ; 
+localparam int unsigned DIV = CLK_HZ / (2 * BCLK_HZ);
 
-    long long sum = 0;
-    int even = 0, odd = 0, prime = 0;
-    int min = INT_MAX, max = INT_MIN;
+//clock generation and timing
+logic bclk_q; 
+logic lrclk_q;
+logic [$clog2(DIV)-1:0] div_cnt_q;
+logic bclk_rise;
+logic bclk_fall;
+logic bclk_fall_q; 
+logic [3:0] bit_idx_q; 
+logic channel_q; 
 
-    for (int i = 0; i < n; i++) {
-        printf("Enter number %d: ", i + 1);
-        while (scanf("%d", &nums[i]) != 1) {
-            printf("Invalid input. Enter an integer: ");
-            flush_stdin();
-        }
+//sample bufferinf (valid/ready)
+logic [SAMPLE_W-1:0] samp_buf_q; 
+logic have_buf_q; 
 
-        sum += nums[i];
-        if (nums[i] < min) min = nums[i];
-        if (nums[i] > max) max = nums[i];
-        if (nums[i] % 2 == 0) even++; else odd++;
-        if (isPrime(nums[i])) prime++;
-    }
+//shift engine 
+logic [SAMPLE_W-1:0] shreg_q;
+logic sdata_q;
 
-    double avg = (double)sum / n;
+//staus / interrupts
+logic underrun_q;
+logic irq_q; 
 
-    printf("\n========== Results ==========\n");
-    printf("  Count   : %d\n", n);
-    printf("  Sum     : %lld\n", sum);
-    printf("  Average : %.2f\n", avg);
-    printf("  Min     : %d\n", min);
-    printf("  Max     : %d\n", max);
-    printf("  Even    : %d\n", even);
-    printf("  Odd     : %d\n", odd);
-    printf("  Primes  : %d", prime);
+//state machine logic 
+typedef enum logic [2:0] { 
+    IDLE,
+    LOAD,
+    SHIFT,
+    ERROR
+} state_e;
 
-    if (prime > 0) {
-        printf("  {");
-        int first = 1;
-        for (int i = 0; i < n; i++) {
-            if (isPrime(nums[i])) {
-                if (!first) printf(", ");
-                printf("%d", nums[i]);
-                first = 0;
-            }
-        }
-        printf("}");
-    }
+state_e state_q, state_d; 
+//state variable reset and initalization 
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+        state_q <= IDLE;
+    end else begin
+        state_q <= state_d; 
+    end
+end
 
-    printf("\n=============================\n");
+always_comb begin
+    state_d = state_q;
+    case (state_q)
+        IDLE: begin 
+            if (enable_i) begin
 
-    free(nums);
-    return 0;
-}
+                state_d = LOAD; 
+            end
+        end 
+        LOAD: begin
+            if (bclk_fall) begin
+                state_d = SHIFT;
+            end 
+        end
+        SHIFT: begin
+            if (bclk_fall && (bit_idx_q == SAMPLE_W - 1)) begin
+                state_d = LOAD; 
+            end
+        end
+        ERROR: begin
+            state_d = IDLE; 
+        end 
+        default: state_d = IDLE;  
+    endcase 
+end
+
+assign sample_ready_o = enable_i && !have_buf_q;
+
+always_ff @(posedge clk_i or negedge rst_ni) begin
+//clock divider 
+if(!rst_ni) begin
+    div_cnt_q <= '0;
+    bclk_q    <=1'b0;
+end else if (!enable_i) begin
+    div_cnt_q <+0;
+    bclk_q    <=1'b0;
+end else begin
+        if (div_cnt_q == DIV-1) begin
+            div_cnt_q <= '0;
+            bclk_q    <= ~bclk_q;
+        end else begin
+            div_cnt_q <= div_cnt_q + 1'b1;
+        end
+    end
+end
+//edge detect for internal use
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+        bclk_fall_q <= 1'b0;
+    end else begin
+        bclk_fall_q <= bclk_q;
+    end
+end
+
+assign bclk_rise = ( bclk_q && !bclk_fall_q);
+assign bclk_fall = (!bclk_q &&  bclk_fall_q);
+
+// --------------------------------------------------
+// Input sample buffer
+// --------------------------------------------------
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+        samp_buf_q <= '0;
+        have_buf_q <= 1'b0;
+    end else begin
+        if (sample_valid_i && sample_ready_o) begin
+            samp_buf_q <= sample_i;
+            have_buf_q <= 1'b1;
+        end else if ((state_q == LOAD) && bclk_fall) begin
+            // buffer gets consumed when a new word is loaded
+            have_buf_q <= 1'b0;
+        end
+    end
+end
+
+// --------------------------------------------------
+// Shift engine + LRCLK generation
+
+
